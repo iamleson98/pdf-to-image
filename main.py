@@ -1,6 +1,9 @@
 from PyPDF2 import PdfReader, PageObject
-from PyPDF2.generic import IndirectObject, PdfObject
-from PyPDF2.constants import AnnotationDictionaryAttributes, FieldDictionaryAttributes
+from PyPDF2.generic import IndirectObject
+from PyPDF2.constants import (
+    AnnotationDictionaryAttributes as AnnDictAttrs,
+    FieldDictionaryAttributes as FieldDictAttrs,
+)
 from dataclasses import dataclass
 import typing
 import pypdfium as PDFIUM
@@ -10,17 +13,24 @@ import asyncio
 import ctypes
 from PIL import Image, ImageDraw
 
+
 LOGGER = logging.getLogger(__name__)
 PDFIUM.FPDF_InitLibraryWithConfig(PDFIUM.FPDF_LIBRARY_CONFIG(2, None, None, 0))
+FORM_FIELD_COLOR = "#cbd4d6"
 
 
-async def convert_rect(height: float, rect: list[float]) -> tuple[float]:
+def convert_rect(page_height: float, rect: list[float]) -> tuple[float]:
     """
     :rect: [bottom_left_x, bottom_left_y, top_right_x, top_right_y]
     """
     assert len(rect) == 4
 
-    return (rect[0], height - rect[1], rect[2], height - rect[3])
+    return (
+        rect[0],
+        float(page_height - rect[3]),
+        rect[2],
+        float(page_height - rect[1]),
+    )
 
 
 @dataclass
@@ -50,14 +60,10 @@ async def parse_page(page: PageObject, page_idx: int) -> PageAttribute:
 
         # we care about form field value, default value, border color, rectangle
         annotation_object_dict = dict(annotation_object)
-        rectangle: list[float] = annotation_object_dict.get(
-            AnnotationDictionaryAttributes.Rect, []
-        )
-        border: list[int] = annotation_object_dict.get(
-            AnnotationDictionaryAttributes.Border, []
-        )
-        value = annotation_object_dict.get(FieldDictionaryAttributes.V, None)
-        default_value = annotation_object_dict.get(FieldDictionaryAttributes.DV, None)
+        rectangle: list[float] = annotation_object_dict.get(AnnDictAttrs.Rect, [])
+        border: list[int] = annotation_object_dict.get(AnnDictAttrs.Border, [])
+        value = annotation_object_dict.get(FieldDictAttrs.V, "")
+        default_value = annotation_object_dict.get(FieldDictAttrs.DV, "")
 
         page_attributes.append(
             AnnotationAttribute(rectangle, border, value, default_value)
@@ -72,7 +78,7 @@ async def construct_image_from_page(page: typing.Any, page_attributes: PageAttri
     # render to bitmap
     try:
         bitmap = PDFIUM.FPDFBitmap_Create(
-            page_attributes.width, page_attributes.height, 0
+            page_attributes.width, page_attributes.height, 1
         )
         PDFIUM.FPDFBitmap_FillRect(
             bitmap, 0, 0, page_attributes.width, page_attributes.height, 0xFFFFFFFF
@@ -84,7 +90,9 @@ async def construct_image_from_page(page: typing.Any, page_attributes: PageAttri
             0,
             page_attributes.width,
             page_attributes.height,
-            PDFIUM.FPDF_LCD_TEXT | PDFIUM.FPDF_ANNOT,
+            0,
+            # PDFIUM.FPDF_ANNOT | PDFIUM.FPDF_LCD_TEXT,
+            0,
         )
         buffer = PDFIUM.FPDFBitmap_GetBuffer(bitmap)
         cast_buffer = ctypes.cast(
@@ -106,42 +114,80 @@ async def construct_image_from_page(page: typing.Any, page_attributes: PageAttri
         artist = ImageDraw.Draw(image)
 
         for attribute in page_attributes.annotation_attributes:
-            converted_rect = await convert_rect(attribute.rect)
+            converted_rect = convert_rect(page_attributes.height, attribute.rect)
+            artist.rectangle(converted_rect, FORM_FIELD_COLOR)
+            # print(page_attributes.height)
+            # print(converted_rect)
 
         # logi here
 
-        # PDFIUM.FPDF_ClosePage(page)
+        # free resource
+        PDFIUM.FPDF_ClosePage(page)
+        if bitmap:
+            PDFIUM.FPDFBitmap_Destroy(bitmap)
+
+        return image
 
     except Exception as e:
-        LOGGER.error(f"Error constructing image: {e}. Exiting...")
+        LOGGER.error(
+            f"Error constructing image: {e}, page {page_attributes.page_index}. Exiting..."
+        )
         sys.exit(1)
 
 
 async def construct_image_from_file(
     file_name: str, file_attributes: list[PageAttribute]
 ):
+    out_file_name = file_name.lower().rsplit(".", 1)[0]
     try:
         pdf_file = PDFIUM.FPDF_LoadDocument(file_name, None)
+
+        total_height = 0
+        max_page_width = 0
+
+        for page_attributes in file_attributes:
+            total_height += page_attributes.height
+            if page_attributes.width > max_page_width:
+                max_page_width = page_attributes.width
+
+        images = await asyncio.gather(
+            *[
+                construct_image_from_page(
+                    PDFIUM.FPDF_LoadPage(pdf_file, page_attributes.page_index),
+                    page_attributes,
+                )
+                for page_attributes in file_attributes
+            ]
+        )
+
+        height_track = 0
+        output_image = Image.new("RGB", (max_page_width, total_height), 0xFFFFFF)
+        for image in images:
+            output_image.paste(image, (0, height_track))
+            height_track += image.height
+
+            # free resource
+            image.close()
+
+        output_image.save(f"{out_file_name}.jpg", "JPEG", subsampling=0, quality=100)
+
+        # free resource
+        PDFIUM.FPDF_CloseDocument(pdf_file)
+        output_image.close()
+
     except Exception as e:
         LOGGER.error(f"failed loading file {e}. exiting...")
         sys.exit(1)
-    else:
-        for page_attributes in file_attributes:
-            page = PDFIUM.FPDF_LoadPage(pdf_file, page_attributes.page_index)
 
 
 async def parse_file(file_name: str) -> list[PageAttribute]:
     assert file_name.lower().endswith(".pdf")
-
     LOGGER.info(f"parsing file {file_name}...")
+
     try:
         pdf_file = PdfReader(file_name, True)
-    except Exception as e:
-        LOGGER.error(f"error: {e}")
-        sys.exit(1)
-    else:
         if len(pdf_file.pages) == 0:
-            LOGGER.warning("file has no page. Exiting...")
+            LOGGER.warning(f"file {file_name} has no page. Exiting...")
             sys.exit(1)
 
         result: list[PageAttribute] = []
@@ -151,15 +197,20 @@ async def parse_file(file_name: str) -> list[PageAttribute]:
 
         return result
 
+    except Exception as e:
+        LOGGER.error(f"error: {e}")
+        sys.exit(1)
+
 
 async def main(file_names: list[str]):
-    for file in file_names:
-        page_attributes = await parse_file(file)
+    await asyncio.gather(
+        *[
+            construct_image_from_file(file_name, await parse_file(file_name))
+            for file_name in file_names
+        ]
+    )
 
 
 if __name__ == "__main__":
     assert len(sys.argv) >= 2
-
-    # main(["file.pdf"])
     asyncio.run(main(sys.argv[1:]))
-
